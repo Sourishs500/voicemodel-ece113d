@@ -12,6 +12,9 @@ from model import VoiceRecognitionSystem, print_model_info
 DATA_DIR = "/Users/sourishsaswade/repos/finalprojece113/ece113d_data"      # Folder containing speaker subfolders
 OUTPUT_MODEL = "voice_model.pt" # Where to save the trained model
 NUM_SPEAKERS = 2
+DURATION_SEC = None  # None = use full file duration
+N_MELS = 128         # Richer mel features
+EMBEDDING_DIM = 64   # Small to avoid overfitting on ~200 clips
 EPOCHS = 50
 BATCH_SIZE = 16
 LEARNING_RATE = 0.001
@@ -20,7 +23,12 @@ VALIDATION_SPLIT = 0.2
 # ============================================================
 
 if __name__ == "__main__":
-    system = VoiceRecognitionSystem(num_speakers=NUM_SPEAKERS)
+    system = VoiceRecognitionSystem(
+        num_speakers=NUM_SPEAKERS,
+        duration_sec=DURATION_SEC,
+        n_mels=N_MELS,
+        embedding_dim=EMBEDDING_DIM,
+    )
     print_model_info(system.model)
     
     system.train(

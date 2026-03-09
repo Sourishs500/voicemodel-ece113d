@@ -1,7 +1,7 @@
 """
-Lightweight Voice Recognition Model
-Target: < 1GB RAM, 5 speakers
-Architecture: Mel spectrogram features + small CNN
+Voice Recognition Model
+Target: up to ~1 GB model size
+Architecture: Mel spectrogram features + large CNN
 
 Requirements:
     pip install torch torchaudio numpy
@@ -26,15 +26,15 @@ class AudioPreprocessor:
     def __init__(
         self,
         sample_rate: int = 16000,
-        n_mels: int = 40,          # Reduced from typical 80 for memory
-        n_fft: int = 400,          # ~25ms window at 16kHz
+        n_mels: int = 128,         # Increased from 40 for richer features
+        n_fft: int = 1024,         # Larger FFT for better frequency resolution
         hop_length: int = 160,     # ~10ms hop
-        duration_sec: float = 2.0  # Fixed input duration
+        duration_sec: Optional[float] = None  # None = use full file duration
     ):
         self.sample_rate = sample_rate
         self.n_mels = n_mels
         self.duration_sec = duration_sec
-        self.target_length = int(sample_rate * duration_sec)
+        self.target_length = int(sample_rate * duration_sec) if duration_sec else None
         
         self.mel_transform = T.MelSpectrogram(
             sample_rate=sample_rate,
@@ -64,6 +64,8 @@ class AudioPreprocessor:
     
     def pad_or_trim(self, waveform: torch.Tensor) -> torch.Tensor:
         """Ensure fixed length for consistent input size"""
+        if self.target_length is None:
+            return waveform
         length = waveform.shape[1]
         
         if length > self.target_length:
@@ -91,98 +93,92 @@ class AudioPreprocessor:
         return mel_spec_db  # Shape: [1, n_mels, time_frames]
 
 
-class LightweightVoiceNet(nn.Module):
+class LargeVoiceNet(nn.Module):
     """
-    Small CNN for speaker identification.
-    
-    Architecture designed for:
-    - < 500KB model size
-    - < 100MB inference memory
-    - 5 speaker classification
-    
-    Total params: ~85K (vs millions in typical voice models)
+    CNN for speaker identification, sized for small datasets (~200 clips).
+
+    Key improvements over original:
+    - 128 mel bins (vs 40) for richer frequency features
+    - SpecAugment in training for better generalization
+    - Small param count (~85K) to avoid overfitting
+
+    Total params: ~85K
     """
-    
+
     def __init__(
         self,
-        n_mels: int = 40,
-        num_speakers: int = 5,
+        n_mels: int = 128,
+        num_speakers: int = 2,
         embedding_dim: int = 64
     ):
         super().__init__()
-        
+
         self.num_speakers = num_speakers
         self.embedding_dim = embedding_dim
-        
-        # Convolutional feature extractor
+
         # Input: [batch, 1, n_mels, time_frames]
         self.conv_layers = nn.Sequential(
-            # Block 1: [1, 40, T] -> [16, 20, T/2]
+            # Block 1: -> [16, n_mels/2, T/2]
             nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(16),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Dropout2d(0.1),
-            
-            # Block 2: [16, 20, T/2] -> [32, 10, T/4]
+
+            # Block 2: -> [32, n_mels/4, T/4]
             nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Dropout2d(0.1),
-            
-            # Block 3: [32, 10, T/4] -> [64, 5, T/8]
+
+            # Block 3: -> [64, n_mels/8, T/8]
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Dropout2d(0.2),
         )
-        
-        # Global average pooling over time (makes model length-invariant)
+
+        # Global average pooling (length-invariant)
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
-        
-        # Embedding layer (useful for speaker verification later)
+
         self.embedding = nn.Sequential(
             nn.Linear(64, embedding_dim),
             nn.ReLU(),
-            nn.Dropout(0.3)
+            nn.Dropout(0.3),
         )
-        
-        # Classification head
+
         self.classifier = nn.Linear(embedding_dim, num_speakers)
-    
+
     def forward(self, x: torch.Tensor, return_embedding: bool = False):
         """
         Args:
             x: Mel spectrogram [batch, 1, n_mels, time_frames]
             return_embedding: If True, also return the embedding vector
-        
+
         Returns:
             logits: [batch, num_speakers]
             embedding (optional): [batch, embedding_dim]
         """
-        # Feature extraction
         features = self.conv_layers(x)
-        
-        # Global pooling
         pooled = self.global_pool(features)
         pooled = pooled.view(pooled.size(0), -1)  # [batch, 64]
-        
-        # Embedding
         emb = self.embedding(pooled)
-        
-        # Classification
         logits = self.classifier(emb)
-        
+
         if return_embedding:
             return logits, emb
         return logits
-    
+
     def get_embedding(self, x: torch.Tensor) -> torch.Tensor:
         """Extract speaker embedding (useful for verification)"""
         _, emb = self.forward(x, return_embedding=True)
         return emb
+
+
+# Keep alias for backwards compat
+LightweightVoiceNet = LargeVoiceNet
 
 
 class VoiceRecognitionSystem:
@@ -194,11 +190,15 @@ class VoiceRecognitionSystem:
     def __init__(
         self,
         num_speakers: int = 5,
-        device: Optional[str] = None
+        device: Optional[str] = None,
+        duration_sec: Optional[float] = None,
+        n_mels: int = 128,
+        embedding_dim: int = 2048
     ):
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.preprocessor = AudioPreprocessor()
-        self.model = LightweightVoiceNet(num_speakers=num_speakers).to(self.device)
+        self.duration_sec = duration_sec
+        self.preprocessor = AudioPreprocessor(duration_sec=duration_sec, n_mels=n_mels)
+        self.model = LargeVoiceNet(n_mels=n_mels, num_speakers=num_speakers, embedding_dim=embedding_dim).to(self.device)
         self.speaker_names: list[str] = []
     
     def prepare_dataset(self, data_dir: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -261,6 +261,19 @@ class VoiceRecognitionSystem:
                 except Exception as e:
                     print(f"    Warning: Failed to load {audio_file.name}: {e}")
         
+        if not features:
+            raise ValueError("No audio files found for training.")
+
+        max_time = max(mel.shape[-1] for mel in features)
+        if any(mel.shape[-1] != max_time for mel in features):
+            padded = []
+            for mel in features:
+                pad_len = max_time - mel.shape[-1]
+                if pad_len > 0:
+                    mel = F.pad(mel, (0, pad_len))
+                padded.append(mel)
+            features = padded
+
         features = torch.stack(features)
         labels = torch.tensor(labels, dtype=torch.long)
         
@@ -304,15 +317,22 @@ class VoiceRecognitionSystem:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
         criterion = nn.CrossEntropyLoss()
         
-        # Data augmentation (simple time masking)
+        # SpecAugment: time masking + frequency masking
+        # Both are proven to improve speaker recognition generalization
         def augment(x):
-            if self.model.training and torch.rand(1).item() > 0.5:
-                # Mask random time segment
-                t = x.shape[-1]
-                mask_len = int(t * 0.1)
-                start = torch.randint(0, t - mask_len, (1,)).item()
-                x = x.clone()
-                x[..., start:start+mask_len] = 0
+            if not self.model.training:
+                return x
+            x = x.clone()
+            # Frequency masking: zero out random mel bands
+            f = x.shape[-2]
+            f_mask = max(1, int(f * 0.15))
+            f_start = torch.randint(0, f - f_mask, (1,)).item()
+            x[..., f_start:f_start + f_mask, :] = 0
+            # Time masking: zero out random time frames
+            t = x.shape[-1]
+            t_mask = max(1, int(t * 0.15))
+            t_start = torch.randint(0, t - t_mask, (1,)).item()
+            x[..., t_start:t_start + t_mask] = 0
             return x
         
         # Training loop
@@ -434,27 +454,44 @@ class VoiceRecognitionSystem:
         torch.save({
             'model_state': self.model.state_dict(),
             'speaker_names': self.speaker_names,
-            'num_speakers': self.model.num_speakers
+            'num_speakers': self.model.num_speakers,
+            'duration_sec': self.duration_sec,
+            'n_mels': self.preprocessor.n_mels,
+            'embedding_dim': self.model.embedding_dim,
         }, path)
         print(f"Model saved to {path}")
     
     def load(self, path: str):
         """Load model and metadata"""
         checkpoint = torch.load(path, map_location=self.device)
+
+        n_mels = checkpoint.get('n_mels', 128)
+        embedding_dim = checkpoint.get('embedding_dim', 2048)
+        num_speakers = checkpoint.get('num_speakers', len(checkpoint.get('speaker_names', [])))
+        duration_sec = checkpoint.get('duration_sec')
+
+        # Rebuild model and preprocessor to match checkpoint architecture
+        self.model = LargeVoiceNet(
+            n_mels=n_mels,
+            num_speakers=num_speakers,
+            embedding_dim=embedding_dim
+        ).to(self.device)
         self.model.load_state_dict(checkpoint['model_state'])
         self.speaker_names = checkpoint['speaker_names']
+        self.duration_sec = duration_sec
+        self.preprocessor = AudioPreprocessor(duration_sec=duration_sec, n_mels=n_mels)
         print(f"Model loaded from {path}")
     
     def memory_usage(self) -> dict:
         """Estimate memory usage"""
         param_size = sum(p.numel() * p.element_size() for p in self.model.parameters())
         buffer_size = sum(b.numel() * b.element_size() for b in self.model.buffers())
-        
+
         return {
-            'model_params': f"{param_size / 1024:.1f} KB",
-            'model_buffers': f"{buffer_size / 1024:.1f} KB",
-            'total_model': f"{(param_size + buffer_size) / 1024:.1f} KB",
-            'estimated_inference_ram': "~50-100 MB"
+            'model_params': f"{param_size / 1024 / 1024:.1f} MB",
+            'model_buffers': f"{buffer_size / 1024 / 1024:.1f} MB",
+            'total_model': f"{(param_size + buffer_size) / 1024 / 1024:.1f} MB",
+            'estimated_inference_ram': f"~{(param_size + buffer_size) * 3 // 1024 // 1024} MB",
         }
 
 
